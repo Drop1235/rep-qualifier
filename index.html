@@ -3,9 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>テニス大会｜8人中4人が代表トーナメント</title>
+  <title>代表決定戦</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Firebase (Realtime Database) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
   <meta name="description" content="8人から4人の代表を決めるワンマッチ方式（4試合）トーナメント。勝者とスコアを入力して右枠に代表を表示。データは自動保存/復元。" />
   <style>
     /* 印刷や細かい拡張は別途。ここでは最小限の補助のみ */
@@ -16,9 +19,11 @@
   <!-- ヘッダー -->
   <header class="max-w-6xl mx-auto px-4 sm:px-6 py-6 flex flex-col gap-4">
     <div class="flex items-center justify-between gap-4 flex-wrap">
-      <h1 class="text-2xl sm:text-3xl font-bold">8人中4人が代表トーナメント</h1>
-      <div class="flex gap-2">
-        <button id="demoBtn" class="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-4 py-2 text-sm sm:text-base">デモ名を入れる</button>
+      <h1 class="text-2xl sm:text-3xl font-bold">代表決定戦</h1>
+      <div class="flex gap-2 flex-wrap items-center">
+        <span id="liveStatus" class="hidden text-sm text-slate-500"></span>
+        <span id="viewOnlyBadge" class="hidden text-xs px-2 py-1 rounded border border-slate-300 bg-slate-100 text-slate-600">閲覧モード</span>
+        <button id="shareBtn" class="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg px-4 py-2 text-sm sm:text-base">共有リンクをコピー</button>
         <button id="resetBtn" class="bg-slate-700 hover:bg-slate-800 text-white rounded-lg px-4 py-2 text-sm sm:text-base">リセット</button>
       </div>
     </div>
@@ -41,7 +46,6 @@
     <div id="matchesContainer" class="grid gap-4 sm:gap-6">
       <!-- 各試合カードはJSで生成（スマホ：縦並び、広い画面：上下間隔） -->
     </div>
-    <p class="text-xs text-slate-500 mt-4">補足：勝者未選択・スコア未入力でもOKで閉じられます（バリデーションなし）。</p>
   </main>
 
   <!-- モーダル（共通、内容はJSで差し替え） -->
@@ -84,6 +88,20 @@
     // 状態管理 / 保存・復元
     // ==============================
     const STORAGE_KEY = 'rep_qualifier_v1';
+    const SEARCH_PARAMS = new URLSearchParams(location.search);
+    // 閲覧専用の判定: ?mode=view もしくは 共有ハッシュ(#s=...)で開いた場合は常に閲覧専用
+    const VIEW_ONLY = (SEARCH_PARAMS.get('mode') === 'view') || (location.hash && location.hash.startsWith('#s='));
+    const ROOM_PARAM = (SEARCH_PARAMS.get('room') || '').trim();
+    // Firebase 設定（あなたのプロジェクトのキーに差し替えてください）
+    const FIREBASE_CONFIG = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+      databaseURL: "https://YOUR_PROJECT_ID-default-rtdb.firebaseio.com",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_PROJECT_ID.appspot.com",
+      messagingSenderId: "",
+      appId: "",
+    };
 
     // players: 8名
     // matches: 4試合 { p1Index, p2Index, winner: 'p1'|'p2'|null, score: '' }
@@ -103,6 +121,155 @@
       } catch (e) {
         console.warn('localStorage に保存できませんでした', e);
       }
+    }
+
+    // 共有URL（ハッシュ）へエンコード/デコード
+    function encodeShareHash() {
+      try {
+        const data = {
+          players: state.players,
+          matches: state.matches.map(m => ({ w: m.winner, s: m.score })),
+        };
+        const json = JSON.stringify(data);
+        const b64 = btoa(unescape(encodeURIComponent(json)));
+        return `#s=${b64}`;
+      } catch (e) {
+        console.warn('共有リンクの生成に失敗', e);
+        return '';
+      }
+    }
+
+    function tryLoadFromHash() {
+      const h = location.hash || '';
+      const m = h.match(/^#s=(.+)$/);
+      if (!m) return false;
+      try {
+        const json = decodeURIComponent(escape(atob(m[1])));
+        const data = JSON.parse(json);
+        if (Array.isArray(data?.players) && Array.isArray(data?.matches)) {
+          state.players = [...Array(8)].map((_, i) => data.players[i] ?? '');
+          state.matches = state.matches.map((mm, i) => {
+            const dm = data.matches[i] || {};
+            return {
+              p1Index: mm.p1Index,
+              p2Index: mm.p2Index,
+              winner: (dm.w === 'p1' || dm.w === 'p2') ? dm.w : null,
+              score: typeof dm.s === 'string' ? dm.s : '',
+            };
+          });
+          return true;
+        }
+      } catch (e) {
+        console.warn('共有リンクの読み込みに失敗', e);
+      }
+      return false;
+    }
+
+    // 現在の状態でURLハッシュを置き換え（履歴は増やさない）
+    function updateShareHash() {
+      const newHash = encodeShareHash();
+      const newUrl = location.pathname + newHash;
+      try {
+        history.replaceState(null, '', newUrl);
+      } catch {}
+    }
+
+    // ==============================
+    // リアルタイム共有（Firebase Realtime Database）
+    // ==============================
+    let fb = { app: null, db: null, ref: null, roomId: null, applying: false, lastSentJson: '', debounceId: null };
+
+    function initFirebaseOnce() {
+      if (fb.app) return;
+      if (!FIREBASE_CONFIG || !FIREBASE_CONFIG.apiKey || FIREBASE_CONFIG.apiKey === 'YOUR_API_KEY') {
+        console.warn('Firebase 設定が未入力です。リアルタイム共有を使うには config を設定してください。');
+        return;
+      }
+      fb.app = firebase.initializeApp(FIREBASE_CONFIG);
+      fb.db = firebase.database();
+    }
+
+    function connectLive(roomId) {
+      initFirebaseOnce();
+      if (!fb.db) {
+        alert('Firebase 設定が未入力のため接続できません。');
+        return;
+      }
+      disconnectLive();
+      fb.roomId = roomId.trim();
+      if (!fb.roomId) return;
+      fb.ref = fb.db.ref(`/rooms/${fb.roomId}`);
+      // 受信
+      fb.ref.on('value', (snap) => {
+        const val = snap.val();
+        if (!val) return;
+        const json = JSON.stringify(val);
+        // 自分が直前に送ったものは無視
+        if (json === fb.lastSentJson) return;
+        fb.applying = true;
+        try {
+          // 反映
+          if (Array.isArray(val.players) && Array.isArray(val.matches)) {
+            state.players = [...Array(8)].map((_, i) => val.players[i] ?? '');
+            state.matches = state.matches.map((mm, i) => {
+              const dm = val.matches[i] || {};
+              return {
+                p1Index: mm.p1Index,
+                p2Index: mm.p2Index,
+                winner:
+                  dm.w === 'p1' ? dm.w : dm.w === 'p2' ? dm.w : null,
+                score: typeof dm.s === 'string' ? dm.s : '',
+              };
+            });
+            saveState();
+            // 閲覧モードUI調整（バッジ表示・共有/リセット非表示）
+            if (VIEW_ONLY) {
+              const badge = document.getElementById('viewOnlyBadge');
+              if (badge) badge.classList.remove('hidden');
+              const shareBtn = document.getElementById('shareBtn');
+              if (shareBtn) shareBtn.classList.add('hidden');
+              const resetBtn = document.getElementById('resetBtn');
+              if (resetBtn) resetBtn.classList.add('hidden');
+            }
+            // 閲覧モードではURLハッシュを変更しない（不変リンクのため）
+            if (!VIEW_ONLY) updateShareHash();
+            render();
+          }
+        } finally {
+          fb.applying = false;
+        }
+      });
+      // URLのroomパラメータがあれば自動接続（閲覧者/編集者ともに入力不要）
+      if (ROOM_PARAM) {
+        connectLive(ROOM_PARAM);
+      }
+      const ls = document.getElementById('liveStatus');
+      if (ls) { ls.textContent = `接続中: ${fb.roomId}`; ls.classList.remove('hidden'); }
+    }
+
+    function disconnectLive() {
+      if (fb.ref) {
+        fb.ref.off();
+        fb.ref = null;
+      }
+      fb.roomId = null;
+      const ls = document.getElementById('liveStatus');
+      if (ls) { ls.textContent = ''; ls.classList.add('hidden'); }
+    }
+
+    function pushLiveDebounced() {
+      if (VIEW_ONLY) return; // 閲覧モードは送信しない
+      if (!fb.db || !fb.ref || fb.applying) return; // 未接続 or 反映中は送らない
+      clearTimeout(fb.debounceId);
+      fb.debounceId = setTimeout(() => {
+        const payload = {
+          players: state.players,
+          matches: state.matches.map(m => ({ w: m.winner, s: m.score })),
+          ts: Date.now(),
+        };
+        fb.lastSentJson = JSON.stringify(payload);
+        fb.ref.set(payload).catch((e) => console.warn('送信失敗', e));
+      }, 200);
     }
 
     function loadState() {
@@ -147,28 +314,12 @@
       const s = parseScore(match.score || '');
       if (!match.score) return '';
       if (!s) {
-        // 任意文字列（W/O 等）は従来の小バッジでそのまま表示
-        return `<span class="absolute -top-2 right-0 md:right-4 text-xs text-slate-600 bg-slate-100 rounded px-2 py-0.5 border">${escapeHtml(match.score)}</span>`;
+        // 任意文字列（W/O 等）は小さなバッジとして表示（右側枠内用のシンプル版）
+        return `<span class="inline-block text-[12px] text-slate-600 bg-slate-100 rounded px-2 py-0.5 border">${escapeHtml(match.score)}</span>`;
       }
-      const hi = s.p1 === s.p2 ? null : (s.p1 > s.p2 ? 'p1' : 'p2');
-      const rowBase = 'flex items-center justify-between gap-3';
-      const rowHi = 'rounded-lg bg-yellow-50/80 px-2 py-1 border border-yellow-200';
-      const rowLo = 'px-1 py-1';
-      return `
-        <div class="absolute right-0 md:right-4 -top-1 md:top-1">
-          <div class="rounded-xl border bg-white/95 backdrop-blur shadow px-3 py-2 min-w-[11rem]">
-            <div class="${rowBase} ${hi === 'p1' ? rowHi : rowLo}">
-              <span class="text-[11px] text-slate-600 max-w-[7rem] truncate">${escapeHtml(p1Name || '')}</span>
-              <span class="text-2xl leading-none font-extrabold text-slate-800">${s.p1}</span>
-            </div>
-            <div class="h-px bg-slate-200 my-1"></div>
-            <div class="${rowBase} ${hi === 'p2' ? rowHi : rowLo}">
-              <span class="text-[11px] text-slate-600 max-w-[7rem] truncate">${escapeHtml(p2Name || '')}</span>
-              <span class="text-2xl leading-none font-extrabold text-slate-800">${s.p2}</span>
-            </div>
-          </div>
-        </div>
-      `;
+      // 数値スコアは「p1 - p2」のシンプル表記
+      const txt = `${s.p1} - ${s.p2}`;
+      return `<span class="inline-block text-[12px] text-slate-700 bg-slate-100 rounded px-2 py-0.5 border">${txt}</span>`;
     }
 
     // ==============================
@@ -197,17 +348,17 @@
                 <input data-role="player" data-index="${match.p2Index}" type="text" class="rounded-lg border px-3 py-2 text-lg" placeholder="選手名を入力" value="${escapeHtml(p2)}" />
               </div>
 
-              <!-- 中央：決定ボタン＋スコア表示 -->
-              <div class="relative flex items-center justify-center min-h-[3.5rem]">
-                <button data-role="openModal" data-match="${idx}" class="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-4 py-2">勝者/スコアを入力</button>
-                ${scoreHtml(match, p1, p2)}
+              <!-- 中央：決定ボタン（スコアは右枠に表示） -->
+              <div class="flex items-center justify-center min-h-[3.5rem]">
+                ${VIEW_ONLY ? '' : `<button data-role="openModal" data-match="${idx}" class="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-4 py-2">勝者/スコアを入力</button>`}
               </div>
 
               <!-- 右：代表枠 -->
               <div class="rounded-2xl border ${decided ? 'border-yellow-400 bg-yellow-50/60' : 'border-slate-200'} p-4 flex items-center justify-between">
-                <div>
+                <div class="flex flex-col gap-1">
                   <div class="text-xs text-slate-500 mb-1">代表枠</div>
                   <div class="text-lg font-semibold min-h-[1.5rem]">${winnerName ? escapeHtml(winnerName) : '<span class=\"text-slate-400\">未決定</span>'}</div>
+                  <div>${scoreHtml(match, p1, p2)}</div>
                 </div>
                 <div class="text-2xl">${decided ? '👑' : ' '}</div>
               </div>
@@ -218,20 +369,38 @@
 
       // 入力イベント/ボタンイベントを付与
       matchesContainer.querySelectorAll('input[data-role="player"]').forEach((input) => {
+        // 入力中は状態保存＋ハッシュ更新のみ（再描画しない）→ フォーカスが飛ぶのを防止
         input.addEventListener('input', (e) => {
+          if (VIEW_ONLY) return; // 閲覧モードでは入力を無視
           const idx = Number(e.target.getAttribute('data-index'));
           state.players[idx] = e.target.value;
           saveState();
-          // 代表名が該当選手のときは表示更新のため再描画
-          render();
+          // 閲覧モードではURLハッシュを更新しない（不変リンクのため）
+          if (!VIEW_ONLY) updateShareHash();
+          pushLiveDebounced();
         });
+        // 入力終了時に再描画して右側の代表名などを同期
+        input.addEventListener('change', () => { if (!VIEW_ONLY) render(); });
+        input.addEventListener('blur', () => { if (!VIEW_ONLY) render(); });
+        // 閲覧モードでは見た目上も無効化
+        if (VIEW_ONLY) {
+          input.setAttribute('disabled', 'true');
+          input.classList.add('bg-slate-100', 'cursor-not-allowed');
+        }
       });
 
       matchesContainer.querySelectorAll('button[data-role="openModal"]').forEach((btn) => {
         btn.addEventListener('click', () => {
+          if (VIEW_ONLY) return; // 閲覧モードではモーダルを開かない
           const matchIndex = Number(btn.getAttribute('data-match'));
           openModal(matchIndex);
         });
+        if (VIEW_ONLY) {
+          btn.setAttribute('disabled', 'true');
+          btn.setAttribute('aria-disabled', 'true');
+          btn.setAttribute('tabindex', '-1');
+          btn.classList.add('opacity-50', 'cursor-not-allowed');
+        }
       });
 
       // 代表者一覧の表示更新
@@ -321,6 +490,7 @@
     modalCancel.addEventListener('click', closeModal);
 
     modalOk.addEventListener('click', () => {
+      if (VIEW_ONLY) return; // 閲覧モードでは保存不可
       if (currentMatchIndex == null) return;
       const m = state.matches[currentMatchIndex];
       const selected = document.querySelector('input[name="winnerRadio"]:checked');
@@ -333,6 +503,8 @@
       m.score = newScore; // 空文字OK
 
       saveState();
+      updateShareHash();
+      pushLiveDebounced();
       render();
       closeModal();
     });
@@ -340,14 +512,24 @@
     // ==============================
     // ヘッダーボタン
     // ==============================
-    document.getElementById('demoBtn').addEventListener('click', () => {
-      const demo = ['Aさん','Bさん','Cさん','Dさん','Eさん','Fさん','Gさん','Hさん'];
-      state.players = demo.slice(0, 8);
-      saveState();
-      render();
+    // 共有リンクをクリップボードへ
+    document.getElementById('shareBtn').addEventListener('click', async () => {
+      // 接続中は不変の閲覧リンクを優先してコピー（?mode=view&room=ID）。
+      // 未接続なら従来の状態付きハッシュURLをコピー。
+      const url = (fb.roomId)
+        ? `${location.origin}${location.pathname}?mode=view&room=${encodeURIComponent(fb.roomId)}`
+        : location.origin + location.pathname + encodeShareHash();
+      try {
+        await navigator.clipboard.writeText(url);
+        alert('共有リンクをコピーしました\n' + url);
+      } catch {
+        // クリップボード不可環境向けにプロンプト
+        prompt('このURLをコピーしてください', url);
+      }
     });
 
     document.getElementById('resetBtn').addEventListener('click', () => {
+      if (VIEW_ONLY) return; // 閲覧モードではリセット不可
       // 完全初期化 + localStorage クリア
       state.players = Array(8).fill('');
       state.matches = [
@@ -357,8 +539,12 @@
         { p1Index: 6, p2Index: 7, winner: null, score: '' },
       ];
       try { localStorage.removeItem(STORAGE_KEY); } catch {}
+      updateShareHash();
+      pushLiveDebounced();
       render();
     });
+
+    // 手動接続UIは撤去。URLパラメータのみで自動接続します。
 
     // ==============================
     // ユーティリティ
@@ -375,7 +561,20 @@
     // ==============================
     // 初期化
     // ==============================
-    loadState();
+    // 共有リンクがあれば優先して読み込み、なければ localStorage
+    if (!tryLoadFromHash()) {
+      loadState();
+    }
+
+    // 閲覧モードの初期UI調整（最初の描画前に反映）
+    if (VIEW_ONLY) {
+      const badge = document.getElementById('viewOnlyBadge');
+      if (badge) badge.classList.remove('hidden');
+      const shareBtn = document.getElementById('shareBtn');
+      if (shareBtn) shareBtn.classList.add('hidden');
+      const resetBtn = document.getElementById('resetBtn');
+      if (resetBtn) resetBtn.classList.add('hidden');
+    }
     render();
   </script>
 </body>
